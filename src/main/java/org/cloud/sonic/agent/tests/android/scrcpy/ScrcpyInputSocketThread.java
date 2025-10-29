@@ -35,26 +35,31 @@ import java.net.Socket;
 import java.util.concurrent.BlockingQueue;
 
 /**
- * scrcpy socket线程
- * 通过端口转发，将设备视频流转发到此Socket
+ * scrcpy socket thread
+ * Forwards device video stream via port forwarding to local socket,
+ * reads NALUs and puts into queue for further processing.
+ *
+ * Updated for scrcpy v3.1+ (e.g., codec/boundary changes, cleanup improvements).
  */
 public class ScrcpyInputSocketThread extends Thread {
 
     private final Logger log = LoggerFactory.getLogger(ScrcpyInputSocketThread.class);
 
-    public final static String ANDROID_INPUT_SOCKET_PRE = "android-scrcpy-input-socket-task-%s-%s-%s";
+    public static final String ANDROID_INPUT_SOCKET_PRE = "android‑scrcpy‑input‑socket‑task‑%s‑%s‑%s";
 
-    private IDevice iDevice;
+    private final IDevice iDevice;
+    private final BlockingQueue<byte[]> dataQueue;
+    private final ScrcpyLocalThread scrcpyLocalThread;
+    private final AndroidTestTaskBootThread androidTestTaskBootThread;
+    private final Session session;
 
-    private BlockingQueue<byte[]> dataQueue;
+    private static final int BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
+    private static final int READ_BUFFER_SIZE = 5 * 1024;    // 5KB
 
-    private ScrcpyLocalThread scrcpyLocalThread;
-
-    private AndroidTestTaskBootThread androidTestTaskBootThread;
-
-    private Session session;
-
-    public ScrcpyInputSocketThread(IDevice iDevice, BlockingQueue<byte[]> dataQueue, ScrcpyLocalThread scrcpyLocalThread, Session session) {
+    public ScrcpyInputSocketThread(IDevice iDevice,
+                                   BlockingQueue<byte[]> dataQueue,
+                                   ScrcpyLocalThread scrcpyLocalThread,
+                                   Session session) {
         this.iDevice = iDevice;
         this.dataQueue = dataQueue;
         this.scrcpyLocalThread = scrcpyLocalThread;
@@ -84,79 +89,102 @@ public class ScrcpyInputSocketThread extends Thread {
         return session;
     }
 
-    private static final int BUFFER_SIZE = 1024 * 1024 * 10;
-    private static final int READ_BUFFER_SIZE = 1024 * 5;
-
-    @Override
-    public void run() {
-        int scrcpyPort = PortTool.getPort();
-        AndroidDeviceBridgeTool.forward(iDevice, scrcpyPort, "scrcpy");
-        Socket videoSocket = new Socket();
-        InputStream inputStream = null;
+    /**
+     * Clean up forwarding, session map etc.
+     */
+    private void cleanup(int scrcpyPort) {
         try {
-            videoSocket.connect(new InetSocketAddress("localhost", scrcpyPort));
-            inputStream = videoSocket.getInputStream();
-            if (videoSocket.isConnected()) {
-                String sizeTotal = AndroidDeviceBridgeTool.getScreenSize(iDevice);
-                JSONObject size = new JSONObject();
-                size.put("msg", "size");
-                size.put("width", sizeTotal.split("x")[0]);
-                size.put("height", sizeTotal.split("x")[1]);
-                BytesTool.sendText(session, size.toJSONString());
-            }
-            int readLength;
-            int naLuIndex;
-            int bufferLength = 0;
-            byte[] buffer = new byte[BUFFER_SIZE];
-            while (scrcpyLocalThread.isAlive()) {
-                readLength = inputStream.read(buffer, bufferLength, READ_BUFFER_SIZE);
-                if (readLength > 0) {
-                    bufferLength += readLength;
-                    for (int i = 5; i < bufferLength - 4; i++) {
-                        if (buffer[i] == 0x00 &&
-                                buffer[i + 1] == 0x00 &&
-                                buffer[i + 2] == 0x00 &&
-                                buffer[i + 3] == 0x01
-                        ) {
-                            naLuIndex = i;
-                            byte[] naluBuffer = new byte[naLuIndex];
-                            System.arraycopy(buffer, 0, naluBuffer, 0, naLuIndex);
-                            dataQueue.add(naluBuffer);
-                            bufferLength -= naLuIndex;
-                            System.arraycopy(buffer, naLuIndex, buffer, 0, bufferLength);
-                            i = 5;
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
-        } finally {
-            if (scrcpyLocalThread.isAlive()) {
-                scrcpyLocalThread.interrupt();
-                log.info("scrcpy thread closed.");
-            }
-            if (videoSocket.isConnected()) {
-                try {
-                    videoSocket.close();
-                    log.info("scrcpy video socket closed.");
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-            if (inputStream != null) {
-                try {
-                    inputStream.close();
-                    log.info("scrcpy input stream closed.");
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
+            AndroidDeviceBridgeTool.removeForward(iDevice, scrcpyPort, "scrcpy");
+        } catch (Exception e) {
+            log.warn("Failed to remove forward for port {}: {}", scrcpyPort, e.getMessage());
         }
-        AndroidDeviceBridgeTool.removeForward(iDevice, scrcpyPort, "scrcpy");
         if (session != null) {
             ScreenMap.getMap().remove(session);
         }
     }
-}
 
+    @Override
+    public void run() {
+        int scrcpyPort = PortTool.getPort();
+        log.info("Forwarding device {} scrcpy port {}", iDevice, scrcpyPort);
+        AndroidDeviceBridgeTool.forward(iDevice, scrcpyPort, "scrcpy");
+
+        try (Socket videoSocket = new Socket()) {
+            videoSocket.connect(new InetSocketAddress("localhost", scrcpyPort));
+            log.info("Connected to scrcpy socket on port {}", scrcpyPort);
+
+            try (InputStream inputStream = videoSocket.getInputStream()) {
+                // On connect, send screen size to client if needed
+                if (videoSocket.isConnected()) {
+                    String sizeTotal = AndroidDeviceBridgeTool.getScreenSize(iDevice);
+                    if (sizeTotal != null && sizeTotal.contains("x")) {
+                        String[] parts = sizeTotal.split("x");
+                        JSONObject size = new JSONObject();
+                        size.put("msg", "size");
+                        size.put("width", parts[0]);
+                        size.put("height", parts[1]);
+                        BytesTool.sendText(session, size.toJSONString());
+                    } else {
+                        log.warn("Unexpected screen size string: {}", sizeTotal);
+                    }
+                }
+
+                byte[] buffer = new byte[BUFFER_SIZE];
+                int bufferLength = 0;
+
+                while (scrcpyLocalThread.isAlive() && !Thread.currentThread().isInterrupted()) {
+                    int readLength = inputStream.read(buffer, bufferLength, READ_BUFFER_SIZE);
+                    if (readLength < 0) {
+                        // End of stream
+                        log.info("End of stream from scrcpy socket");
+                        break;
+                    }
+                    if (readLength == 0) {
+                        // No data, loop again (or wait)
+                        continue;
+                    }
+
+                    bufferLength += readLength;
+
+                    // Look for NALU boundary 0x00 0x00 0x00 0x01
+                    // Note: scrcpy v3.1+ may use alternate encodings (AV1 etc),
+                    // so you may need to adjust this logic if you receive different markers.
+                    for (int i = 5; i < bufferLength - 4; i++) {
+                        if (buffer[i] == 0x00 &&
+                            buffer[i+1] == 0x00 &&
+                            buffer[i+2] == 0x00 &&
+                            buffer[i+3] == 0x01) {
+                            int naluIndex = i;
+                            byte[] naluBuffer = new byte[naluIndex];
+                            System.arraycopy(buffer, 0, naluBuffer, 0, naluIndex);
+                            dataQueue.add(naluBuffer);
+                            // shift remaining bytes to front
+                            bufferLength -= naluIndex;
+                            System.arraycopy(buffer, naluIndex, buffer, 0, bufferLength);
+                            i = 5; // reset scan index
+                        }
+                    }
+
+                    // Optional: if buffer gets too large (i.e., no boundary found),
+                    // you may want to flush entire buffer or handle differently to avoid overflow.
+                    if (bufferLength >= BUFFER_SIZE - READ_BUFFER_SIZE) {
+                        log.warn("Buffer nearing capacity, flushing {} bytes", bufferLength);
+                        byte[] leftover = new byte[bufferLength];
+                        System.arraycopy(buffer, 0, leftover, 0, bufferLength);
+                        dataQueue.add(leftover);
+                        bufferLength = 0;
+                    }
+                }
+            }
+        } catch (IOException e) {
+            log.error("IOException in scrcpy input socket thread", e);
+        } finally {
+            if (scrcpyLocalThread.isAlive()) {
+                scrcpyLocalThread.interrupt();
+                log.info("scrcpyLocalThread interrupted due to input socket termination");
+            }
+            cleanup(scrcpyPort);
+            log.info("Cleaned up scrcpy port forwarding and session map");
+        }
+    }
+}
