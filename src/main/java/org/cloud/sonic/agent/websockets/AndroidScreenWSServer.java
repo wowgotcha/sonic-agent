@@ -138,7 +138,10 @@ public class AndroidScreenWSServer implements IAndroidWSServer {
             }
             case "pic" -> {
                 picMap.put(udId, msg.getString("detail"));
-                startScreen(session);
+                IDevice iDevice = udIdMap.get(session);
+                if (androidMonitorHandler.isMonitorRunning(iDevice) && AndroidDeviceManagerMap.getRotationMap().get(iDevice.getSerialNumber()) != null) {
+                    startScreen(session);
+                }
             }
         }
     }
