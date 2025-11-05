@@ -131,7 +131,7 @@ public class AndroidWSServer implements IAndroidWSServer {
 
         AndroidSupplyTool.startShare(udId, session);
 
-        openDriver(iDevice, session);
+        // openDriver(iDevice, session); // don't open driver in open
 
         String currentIme = AndroidDeviceBridgeTool.executeCommand(iDevice, "settings get secure default_input_method");
         if (!currentIme.contains("org.cloud.sonic.android/.keyboard.SonicKeyboard")) {
